@@ -276,15 +276,21 @@ class OrderDetailFetcher:
                 # 访问页面（带重试机制）
                 max_retries = 2
                 response = None
+                nav_wait_until = 'domcontentloaded'
 
                 for retry in range(max_retries + 1):
                     try:
-                        response = await self.page.goto(url, wait_until='networkidle', timeout=timeout * 1000)
+                        response = await self.page.goto(url, wait_until=nav_wait_until, timeout=timeout * 1000)
 
-                        if response and response.status == 200:
+                        # response 可能为 None（例如某些重定向场景），此时只要页面可用即可继续
+                        if response is None:
+                            logger.warning("页面响应对象为空，继续按已加载页面解析")
                             break
-                        else:
-                            logger.warning(f"页面访问失败，状态码: {response.status if response else 'None'}，重试 {retry + 1}/{max_retries + 1}")
+
+                        if response.status in (200, 304):
+                            break
+
+                        logger.warning(f"页面访问失败，状态码: {response.status}，重试 {retry + 1}/{max_retries + 1}")
 
                     except Exception as e:
                         logger.warning(f"页面访问异常: {e}，重试 {retry + 1}/{max_retries + 1}")
@@ -305,21 +311,25 @@ class OrderDetailFetcher:
 
                         await asyncio.sleep(1)  # 重试前等待1秒
 
-                if not response or response.status != 200:
-                    logger.error(f"页面访问最终失败，状态码: {response.status if response else 'None'}")
+                # 对明确的错误状态码进行失败处理；response 为 None 则继续尝试解析
+                if response is not None and response.status >= 400:
+                    logger.error(f"页面访问最终失败，状态码: {response.status}")
                     return None
 
                 logger.info("页面加载成功，等待内容渲染...")
 
-                # 等待页面完全加载
+                # 轻量等待页面可交互，避免 networkidle 被长连接拖死
                 try:
-                    await self.page.wait_for_load_state('networkidle')
+                    await self.page.wait_for_load_state('domcontentloaded', timeout=8000)
                 except Exception as e:
                     logger.warning(f"等待页面加载状态失败: {e}")
                     # 继续执行，不中断流程
 
-                # 额外等待确保动态内容加载完成
-                await asyncio.sleep(3)
+                # 优先等关键元素，失败时再给短暂兜底等待
+                try:
+                    await self.page.wait_for_selector('.sku--u_ddZval, .boldNum--JgEOXfA3', timeout=5000)
+                except Exception:
+                    await asyncio.sleep(1.5)
 
                 # 获取并解析SKU信息
                 sku_info = await self._get_sku_content()

@@ -79,41 +79,62 @@ class OrderStatusHandler:
         # 设置日志级别
         log_level = self.config.get('log_level', 'info')
         logger.info(f"订单状态处理器初始化完成，配置: {self.config}")
+
+    @staticmethod
+    def _summarize_message_for_log(message: dict) -> str:
+        """生成订单消息摘要，避免打印整包原始内容。"""
+        try:
+            if not isinstance(message, dict):
+                return f"type={type(message).__name__}"
+
+            message_1 = message.get("1", {}) if isinstance(message.get("1"), dict) else {}
+            message_10 = message_1.get("10", {}) if isinstance(message_1.get("10"), dict) else {}
+
+            summary = {
+                "top_keys": list(message.keys()),
+                "message_keys": list(message_1.keys()) if isinstance(message_1, dict) else [],
+                "sender_user_id": message_10.get("senderUserId"),
+                "reminder_content": message_10.get("reminderContent"),
+                "detail_notice": message_10.get("detailNotice"),
+                "message_1_3": message_1.get("3"),
+            }
+            return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        except Exception as e:
+            return f"summary_error={e}"
     
     def extract_order_id(self, message: dict) -> Optional[str]:
         """从消息中提取订单ID"""
         try:
             order_id = None
             
-            # 先查看消息的完整结构
-            logger.info(f"🔍 完整消息结构: {message}")
+            logger.debug(f"🔍 订单消息摘要: {self._summarize_message_for_log(message)}")
             
             # 检查message['1']的结构，处理可能是列表、字典或字符串的情况
             message_1 = message.get('1', {})
             content_json_str = ''
             
             if isinstance(message_1, dict):
-                logger.info(f"🔍 message['1'] 是字典，keys: {list(message_1.keys())}")
+                logger.debug(f"🔍 message['1'] 是字典，keys: {list(message_1.keys())}")
                 
                 # 检查message['1']['6']的结构
                 message_1_6 = message_1.get('6', {})
                 if isinstance(message_1_6, dict):
-                    logger.info(f"🔍 message['1']['6'] 是字典，keys: {list(message_1_6.keys())}")
+                    logger.debug(f"🔍 message['1']['6'] 是字典，keys: {list(message_1_6.keys())}")
                     # 方法1: 从button的targetUrl中提取orderId
                     content_json_str = message_1_6.get('3', {}).get('5', '') if isinstance(message_1_6.get('3', {}), dict) else ''
                 else:
-                    logger.info(f"🔍 message['1']['6'] 不是字典: {type(message_1_6)}")
+                    logger.debug(f"🔍 message['1']['6'] 不是字典: {type(message_1_6)}")
             
             elif isinstance(message_1, list):
-                logger.info(f"🔍 message['1'] 是列表，长度: {len(message_1)}")
+                logger.debug(f"🔍 message['1'] 是列表，长度: {len(message_1)}")
                 # 如果message['1']是列表，跳过这种提取方式
             
             elif isinstance(message_1, str):
-                logger.info(f"🔍 message['1'] 是字符串，长度: {len(message_1)}")
+                logger.debug(f"🔍 message['1'] 是字符串，长度: {len(message_1)}")
                 # 如果message['1']是字符串，跳过这种提取方式
             
             else:
-                logger.info(f"🔍 message['1'] 未知类型: {type(message_1)}")
+                logger.debug(f"🔍 message['1'] 未知类型: {type(message_1)}")
                 # 其他类型，跳过这种提取方式
             
             if content_json_str:

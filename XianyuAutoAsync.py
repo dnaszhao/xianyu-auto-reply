@@ -204,6 +204,132 @@ class XianyuLive:
             except:
                 return "未知错误"
 
+    @staticmethod
+    def _normalize_buyer_id(buyer_id):
+        """标准化买家ID，过滤消息里的占位值。"""
+        if buyer_id is None:
+            return None
+
+        normalized = str(buyer_id).strip()
+        if not normalized:
+            return None
+
+        if normalized.lower() in {"unknown", "unknown_user", "none", "null", "undefined"}:
+            return None
+
+        if normalized in {"未知", "未知用户"}:
+            return None
+
+        return normalized
+
+    def _order_needs_buyer_id_backfill(self, order_info):
+        """判断订单是否需要回填买家ID。"""
+        if not order_info:
+            return True
+        return self._normalize_buyer_id(order_info.get('buyer_id')) is None
+
+    def _summarize_message_for_log(self, message: dict) -> str:
+        """生成消息摘要，避免在日志中输出整包原始消息。"""
+        try:
+            if not isinstance(message, dict):
+                return f"type={type(message).__name__}"
+
+            message_1 = message.get("1", {}) if isinstance(message.get("1"), dict) else {}
+            message_10 = message_1.get("10", {}) if isinstance(message_1.get("10"), dict) else {}
+            message_3 = message.get("3", {}) if isinstance(message.get("3"), dict) else {}
+
+            summary = {
+                "top_keys": list(message.keys()),
+                "message_keys": list(message_1.keys()) if isinstance(message_1, dict) else [],
+                "sender_user_id": message_10.get("senderUserId"),
+                "sender_nick": message_10.get("senderNick") or message_10.get("reminderTitle"),
+                "reminder_content": message_10.get("reminderContent"),
+                "detail_notice": message_10.get("detailNotice"),
+                "red_reminder": message_3.get("redReminder"),
+                "session_type": message_10.get("sessionType"),
+                "message_1_3": message_1.get("3"),
+            }
+            return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        except Exception as e:
+            return f"summary_error={self._safe_str(e)}"
+
+    def _extract_item_id_from_message_field(self, message: dict):
+        """优先从消息主体字段提取商品ID，避免被 reminderUrl 中的聊天商品ID误导。"""
+        try:
+            if not isinstance(message, dict):
+                return None
+
+            message_1 = message.get("1", {})
+            if isinstance(message_1, dict):
+                message_1_item = message_1.get("3")
+                if isinstance(message_1_item, str):
+                    patterns = [
+                        r'(\d{8,})\.PNM',
+                        r'itemId[=:]"?(\d{8,})',
+                        r'"itemId"\s*:\s*"(\d{8,})"',
+                        r'^(\d{8,})$',
+                    ]
+                    for pattern in patterns:
+                        match = re.search(pattern, message_1_item)
+                        if match:
+                            item_id = match.group(1)
+                            logger.info(f"【{self.cookie_id}】从message['1']['3']提取商品ID: {item_id}")
+                            return item_id
+            return None
+        except Exception as e:
+            logger.debug(f"【{self.cookie_id}】从消息主体字段提取商品ID失败: {self._safe_str(e)}")
+            return None
+
+    @staticmethod
+    def _get_ignored_system_message_reason(send_message: str):
+        """返回应跳过处理的系统消息原因。"""
+        ignored_messages = {
+            '[我已拍下，待付款]': '系统消息不处理',
+            '[你关闭了订单，钱款已原路退返]': '系统消息不处理',
+            '[不想宝贝被砍价?设置不砍价回复  ]': '系统提示信息不处理',
+            'AI正在帮你回复消息，不错过每笔订单': '系统提示信息不处理',
+            '发来一条消息': '系统通知消息不处理',
+            '发来一条新消息': '系统通知消息不处理',
+            '[买家确认收货，交易成功]': '交易完成消息不处理',
+            '快给ta一个评价吧~': '评价提醒消息不处理',
+            '快给ta一个评价吧～': '评价提醒消息不处理',
+            '卖家人不错？送Ta闲鱼小红花': '小红花提醒消息不处理',
+            '[你已确认收货，交易成功]': '买家确认收货消息不处理',
+            '[你已发货]': '发货确认消息不处理',
+            '已发货': '发货确认消息不处理',
+        }
+        return ignored_messages.get(send_message)
+
+    def _check_delivery_ownership(self, item_id: str = None, order_id: str = None):
+        """检查自动发货归属。
+
+        返回:
+            (allowed: bool, reason: str)
+        """
+        try:
+            from db_manager import db_manager
+
+            # 1) 优先使用订单归属判断（最可靠）
+            if order_id:
+                order_info = db_manager.get_order_by_id(order_id)
+                if order_info:
+                    order_cookie = str(order_info.get('cookie_id') or '').strip()
+                    if order_cookie and order_cookie != str(self.cookie_id):
+                        return False, f"订单 {order_id} 归属账号 {order_cookie}，与当前账号 {self.cookie_id} 不一致"
+                    return True, f"订单 {order_id} 归属校验通过"
+
+            # 2) 退化到商品缓存归属判断
+            if item_id and item_id != "未知商品":
+                item_info = db_manager.get_item_info(self.cookie_id, item_id)
+                if item_info:
+                    return True, f"商品 {item_id} 归属校验通过"
+
+            # 3) 最后兜底：无法验证时不阻断自动发货（避免因入库延迟误伤）
+            return True, "未命中订单/商品归属缓存，按当前账号会话继续处理"
+        except Exception as e:
+            # 查询异常也不应硬拦截，否则会导致整条发货链断掉
+            return True, f"归属校验异常，按当前账号会话继续处理: {self._safe_str(e)}"
+
     def _set_connection_state(self, new_state: ConnectionState, reason: str = ""):
         """设置连接状态并记录日志"""
         if self.connection_state != new_state:
@@ -839,9 +965,16 @@ class XianyuLive:
 
         return True
 
-    def mark_delivery_sent(self, order_id: str):
-        """标记订单已发货"""
+    def mark_delivery_content_sent(self, order_id: str):
+        """标记订单发货内容已发送，用于防重复发送。"""
         self.delivery_sent_orders.add(order_id)
+        self.last_delivery_time[order_id] = time.time()
+        logger.info(f"【{self.cookie_id}】订单 {order_id} 已标记为发货内容已发送")
+
+    def mark_delivery_sent(self, order_id: str):
+        """标记订单已在平台确认发货。"""
+        self.delivery_sent_orders.add(order_id)
+        self.last_delivery_time[order_id] = time.time()
         logger.info(f"【{self.cookie_id}】订单 {order_id} 已标记为发货")
         
         # 更新订单状态为已发货
@@ -971,56 +1104,209 @@ class XianyuLive:
 
     def _is_auto_delivery_trigger(self, message: str) -> bool:
         """检查消息是否为自动发货触发关键字"""
-        # 定义所有自动发货触发关键字
-        auto_delivery_keywords = [
-            # 系统消息
+        return self._extract_auto_delivery_trigger_keyword(message) is not None
+
+    @staticmethod
+    def _get_auto_delivery_trigger_keywords():
+        return [
             '[我已付款，等待你发货]',
             '[已付款，待发货]',
             '我已付款，等待你发货',
             '[记得及时发货]',
+            '已付款，待发货',
+            '等待卖家发货',
+            '等待你发货',
+            '[我已小刀，待刀成]',
+            '我已小刀，待刀成',
+            '待发货',
         ]
 
-        # 检查消息是否包含任何触发关键字
-        for keyword in auto_delivery_keywords:
-            if keyword in message:
-                return True
+    def _extract_auto_delivery_trigger_keyword(self, message: str):
+        if not message:
+            return None
+        text = str(message)
+        for keyword in self._get_auto_delivery_trigger_keywords():
+            if keyword in text:
+                return keyword
+        return None
 
-        return False
+    def _extract_card_title_from_message(self, message: dict):
+        """从卡片消息中提取标题（如：我已小刀，待刀成）。"""
+        try:
+            if not isinstance(message, dict):
+                return None
+
+            message_1 = message.get("1", {})
+            if not isinstance(message_1, dict):
+                return None
+
+            message_6 = message_1.get("6", {})
+            if not isinstance(message_6, dict):
+                return None
+
+            message_6_3 = message_6.get("3", {})
+            if not isinstance(message_6_3, dict):
+                return None
+
+            raw_content = message_6_3.get("5")
+            if not isinstance(raw_content, str) or not raw_content.strip():
+                return None
+
+            card_content = json.loads(raw_content)
+            title = (
+                card_content.get("dxCard", {})
+                .get("item", {})
+                .get("main", {})
+                .get("exContent", {})
+                .get("title", "")
+            )
+            title = str(title).strip() if title is not None else ""
+            return title or None
+        except Exception:
+            return None
+
+    def _find_pending_delivery_order_candidate(self, item_id: str = None, buyer_id: str = None, msg_time: str = None):
+        """多策略回查可自动发货的候选订单（仅返回唯一待发货订单）。"""
+        try:
+            from db_manager import db_manager
+
+            normalized_item_id = str(item_id).strip() if item_id else None
+            if normalized_item_id and normalized_item_id.startswith("auto_"):
+                normalized_item_id = None
+
+            normalized_buyer_id = self._normalize_buyer_id(buyer_id)
+            strategies = []
+
+            if normalized_item_id and normalized_buyer_id:
+                strategies.append(("item+buyer", normalized_item_id, normalized_buyer_id))
+            if normalized_buyer_id:
+                strategies.append(("buyer_only", None, normalized_buyer_id))
+            if normalized_item_id:
+                strategies.append(("item_only", normalized_item_id, None))
+            strategies.append(("unique_pending_ship", None, None))
+
+            seen = set()
+            for strategy_name, strategy_item_id, strategy_buyer_id in strategies:
+                key = (strategy_item_id or "", strategy_buyer_id or "")
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                candidate_order_id = db_manager.find_delivery_order_candidate(
+                    cookie_id=self.cookie_id,
+                    item_id=strategy_item_id,
+                    buyer_id=strategy_buyer_id,
+                    status_priority=['pending_ship']
+                )
+                if candidate_order_id:
+                    if msg_time:
+                        logger.warning(f'[{msg_time}] 【{self.cookie_id}】⚠️ 回查候选订单命中({strategy_name}): {candidate_order_id}')
+                    else:
+                        logger.warning(f'【{self.cookie_id}】⚠️ 回查候选订单命中({strategy_name}): {candidate_order_id}')
+                    return candidate_order_id
+
+            return None
+        except Exception as e:
+            if msg_time:
+                logger.error(f'[{msg_time}] 【{self.cookie_id}】回查候选订单失败: {self._safe_str(e)}')
+            else:
+                logger.error(f'【{self.cookie_id}】回查候选订单失败: {self._safe_str(e)}')
+            return None
+
+    @staticmethod
+    def _is_placeholder_item_title(item_title: str) -> bool:
+        """判断是否为占位商品标题。"""
+        if not item_title:
+            return True
+        normalized = str(item_title).strip()
+        if not normalized:
+            return True
+        placeholders = {
+            "待获取商品信息",
+            "未知商品",
+            "商品信息获取失败",
+            "自动获取商品信息",
+            "N/A",
+            "-",
+        }
+        return normalized in placeholders
+
+    def _extract_non_chat_trigger_message(self, message: dict):
+        """从非聊天消息中提取可路由的触发文案。"""
+        try:
+            candidates = []
+            if isinstance(message, dict):
+                message_3 = message.get("3", {})
+                if isinstance(message_3, dict):
+                    for key in ["redReminder", "detailNotice", "reminderNotice", "reminderTitle", "content"]:
+                        value = message_3.get(key)
+                        if isinstance(value, str) and value.strip():
+                            candidates.append(value.strip())
+
+                message_1 = message.get("1", {})
+                if isinstance(message_1, dict):
+                    message_10 = message_1.get("10", {})
+                    if isinstance(message_10, dict):
+                        for key in ["reminderContent", "detailNotice", "reminderNotice", "reminderTitle", "redReminder"]:
+                            value = message_10.get(key)
+                            if isinstance(value, str) and value.strip():
+                                candidates.append(value.strip())
+
+                    message_6 = message_1.get("6", {})
+                    if isinstance(message_6, dict):
+                        message_6_3 = message_6.get("3", {})
+                        if isinstance(message_6_3, dict):
+                            content_2 = message_6_3.get("2")
+                            if isinstance(content_2, str) and content_2.strip():
+                                candidates.append(content_2.strip())
+
+                card_title = self._extract_card_title_from_message(message)
+                if card_title:
+                    candidates.append(card_title)
+
+            for text in candidates:
+                keyword = self._extract_auto_delivery_trigger_keyword(text)
+                if keyword:
+                    return keyword
+
+            # 最后从整包消息字符串兜底提取
+            return self._extract_auto_delivery_trigger_keyword(str(message))
+        except Exception:
+            return None
 
     def _extract_order_id(self, message: dict) -> str:
         """从消息中提取订单ID"""
         try:
             order_id = None
 
-            # 先查看消息的完整结构
-            logger.warning(f"【{self.cookie_id}】🔍 完整消息结构: {message}")
+            logger.debug(f"【{self.cookie_id}】🔍 订单消息摘要: {self._summarize_message_for_log(message)}")
 
             # 检查message['1']的结构，处理可能是列表、字典或字符串的情况
             message_1 = message.get('1', {})
             content_json_str = ''
 
             if isinstance(message_1, dict):
-                logger.warning(f"【{self.cookie_id}】🔍 message['1'] 是字典，keys: {list(message_1.keys())}")
+                logger.debug(f"【{self.cookie_id}】🔍 message['1'] 是字典，keys: {list(message_1.keys())}")
 
                 # 检查message['1']['6']的结构
                 message_1_6 = message_1.get('6', {})
                 if isinstance(message_1_6, dict):
-                    logger.warning(f"【{self.cookie_id}】🔍 message['1']['6'] 是字典，keys: {list(message_1_6.keys())}")
+                    logger.debug(f"【{self.cookie_id}】🔍 message['1']['6'] 是字典，keys: {list(message_1_6.keys())}")
                     # 方法1: 从button的targetUrl中提取orderId
                     content_json_str = message_1_6.get('3', {}).get('5', '') if isinstance(message_1_6.get('3', {}), dict) else ''
                 else:
-                    logger.warning(f"【{self.cookie_id}】🔍 message['1']['6'] 不是字典: {type(message_1_6)}")
+                    logger.debug(f"【{self.cookie_id}】🔍 message['1']['6'] 不是字典: {type(message_1_6)}")
 
             elif isinstance(message_1, list):
-                logger.warning(f"【{self.cookie_id}】🔍 message['1'] 是列表，长度: {len(message_1)}")
+                logger.debug(f"【{self.cookie_id}】🔍 message['1'] 是列表，长度: {len(message_1)}")
                 # 如果message['1']是列表，跳过这种提取方式
 
             elif isinstance(message_1, str):
-                logger.warning(f"【{self.cookie_id}】🔍 message['1'] 是字符串，长度: {len(message_1)}")
+                logger.debug(f"【{self.cookie_id}】🔍 message['1'] 是字符串，长度: {len(message_1)}")
                 # 如果message['1']是字符串，跳过这种提取方式
 
             else:
-                logger.warning(f"【{self.cookie_id}】🔍 message['1'] 未知类型: {type(message_1)}")
+                logger.debug(f"【{self.cookie_id}】🔍 message['1'] 未知类型: {type(message_1)}")
                 # 其他类型，跳过这种提取方式
 
             if content_json_str:
@@ -1032,6 +1318,8 @@ class XianyuLive:
                     if target_url:
                         # 从URL中提取orderId参数
                         order_match = re.search(r'orderId=(\d+)', target_url)
+                        if not order_match:
+                            order_match = re.search(r'bizOrderId=(\d+)', target_url)
                         if order_match:
                             order_id = order_match.group(1)
                             logger.info(f'【{self.cookie_id}】✅ 从button提取到订单ID: {order_id}')
@@ -1041,6 +1329,8 @@ class XianyuLive:
                         main_target_url = content_data.get('dxCard', {}).get('item', {}).get('main', {}).get('targetUrl', '')
                         if main_target_url:
                             order_match = re.search(r'order_detail\?id=(\d+)', main_target_url)
+                            if not order_match:
+                                order_match = re.search(r'order-detail\?orderId=(\d+)', main_target_url)
                             if order_match:
                                 order_id = order_match.group(1)
                                 logger.info(f'【{self.cookie_id}】✅ 从main targetUrl提取到订单ID: {order_id}')
@@ -1056,6 +1346,10 @@ class XianyuLive:
                     if dynamic_target_url:
                         # 从order_detail URL中提取id参数
                         order_match = re.search(r'order_detail\?id=(\d+)', dynamic_target_url)
+                        if not order_match:
+                            order_match = re.search(r'order-detail\?orderId=(\d+)', dynamic_target_url)
+                        if not order_match:
+                            order_match = re.search(r'bizOrderId=(\d+)', dynamic_target_url)
                         if order_match:
                             order_id = order_match.group(1)
                             logger.info(f'【{self.cookie_id}】✅ 从order_detail提取到订单ID: {order_id}')
@@ -1070,10 +1364,11 @@ class XianyuLive:
 
                     # 搜索各种可能的订单ID模式
                     patterns = [
-                        r'orderId[=:](\d{10,})',  # orderId=123456789 或 orderId:123456789
+                        r'orderId["\']?\s*[:=]\s*["\']?(\d{10,})',  # orderId=123456789 / "orderId":"123456789"
                         r'order_detail\?id=(\d{10,})',  # order_detail?id=123456789
+                        r'order-detail\?orderId=(\d{10,})',  # order-detail?orderId=123456789
                         r'"id"\s*:\s*"?(\d{10,})"?',  # "id":"123456789" 或 "id":123456789
-                        r'bizOrderId[=:](\d{10,})',  # bizOrderId=123456789
+                        r'bizOrderId["\']?\s*[:=]\s*["\']?(\d{10,})',  # bizOrderId=123456789 / "bizOrderId":"123456789"
                     ]
 
                     for pattern in patterns:
@@ -1102,26 +1397,42 @@ class XianyuLive:
                                    item_id: str, chat_id: str, msg_time: str):
         """统一处理自动发货逻辑"""
         try:
-            # 检查商品是否属于当前cookies
-            if item_id and item_id != "未知商品":
-                try:
-                    from db_manager import db_manager
-                    item_info = db_manager.get_item_info(self.cookie_id, item_id)
-                    if not item_info:
-                        logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 商品 {item_id} 不属于当前账号，跳过自动发货')
-                        return
-                    logger.warning(f'[{msg_time}] 【{self.cookie_id}】✅ 商品 {item_id} 归属验证通过')
-                except Exception as e:
-                    logger.error(f'[{msg_time}] 【{self.cookie_id}】检查商品归属失败: {self._safe_str(e)}，跳过自动发货')
-                    return
-
             # 提取订单ID
             order_id = self._extract_order_id(message)
 
-            # 如果order_id不存在，直接返回
+            # 如果order_id不存在，尝试根据cookie+item(+buyer)回查唯一待发货订单
             if not order_id:
-                logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 未能提取到订单ID，跳过自动发货')
+                order_id = self._find_pending_delivery_order_candidate(
+                    item_id=item_id,
+                    buyer_id=send_user_id,
+                    msg_time=msg_time
+                )
+
+            if not order_id:
+                logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 未能提取到订单ID且无候选订单，跳过自动发货')
                 return
+
+            # 订单存在时，以订单中的item_id为准，纠正消息中误提取的商品ID
+            try:
+                from db_manager import db_manager
+                order_info = db_manager.get_order_by_id(order_id)
+                db_item_id = str(order_info.get('item_id') or '').strip() if order_info else ''
+                if db_item_id:
+                    if not item_id or str(item_id).startswith('auto_'):
+                        logger.warning(f'[{msg_time}] 【{self.cookie_id}】⚠️ 使用订单中的商品ID替换占位商品ID: {db_item_id}')
+                        item_id = db_item_id
+                    elif str(item_id) != db_item_id:
+                        logger.warning(f'[{msg_time}] 【{self.cookie_id}】⚠️ 消息商品ID({item_id})与订单商品ID({db_item_id})不一致，已按订单纠正')
+                        item_id = db_item_id
+            except Exception as e:
+                logger.error(f'[{msg_time}] 【{self.cookie_id}】读取订单商品ID失败: {self._safe_str(e)}')
+
+            # 归属校验（弱校验策略，避免因订单/商品入库延迟导致误拦截）
+            allowed, reason = self._check_delivery_ownership(item_id=item_id, order_id=order_id)
+            if not allowed:
+                logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 自动发货归属校验失败，跳过: {reason}')
+                return
+            logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 自动发货归属校验通过: {reason}')
 
             # 订单ID已提取，将在自动发货时进行确认发货处理
             logger.info(f'[{msg_time}] 【{self.cookie_id}】提取到订单ID: {order_id}，将在自动发货时处理确认发货')
@@ -1203,11 +1514,21 @@ class XianyuLive:
                     # 多次调用自动发货方法，每次获取不同的内容
                     delivery_contents = []
                     success_count = 0
+                    platform_confirmed = False
+                    confirm_errors = []
 
                     for i in range(quantity_to_send):
                         try:
                             # 每次调用都可能获取不同的内容（API卡券、批量数据等）
-                            delivery_content = await self._auto_delivery(item_id, item_title, order_id, send_user_id)
+                            delivery_result = await self._auto_delivery(item_id, item_title, order_id, send_user_id)
+                            if isinstance(delivery_result, dict):
+                                delivery_content = delivery_result.get('content')
+                                platform_confirmed = platform_confirmed or bool(delivery_result.get('platform_confirmed'))
+                                if delivery_result.get('confirm_error'):
+                                    confirm_errors.append(delivery_result.get('confirm_error'))
+                            else:
+                                # 兼容旧返回值
+                                delivery_content = delivery_result
                             if delivery_content:
                                 delivery_contents.append(delivery_content)
                                 success_count += 1
@@ -1219,8 +1540,19 @@ class XianyuLive:
                             logger.error(f"第 {i+1}/{quantity_to_send} 个卡券获取异常: {self._safe_str(e)}")
 
                     if delivery_contents:
-                        # 标记已发货（防重复）- 基于订单ID
-                        self.mark_delivery_sent(order_id)
+                        # 标记内容已发送（防重复）- 基于订单ID
+                        self.mark_delivery_content_sent(order_id)
+
+                        # 只有平台确认发货成功时，才把订单状态推进为“已发货”。
+                        # 内容发送成功不等于闲鱼订单已发货。
+                        if platform_confirmed:
+                            self.mark_delivery_sent(order_id)
+                        else:
+                            error_text = confirm_errors[-1] if confirm_errors else "未执行或未成功确认发货"
+                            logger.warning(
+                                f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 发货内容已发送，'
+                                f'但平台确认发货未成功，订单状态保持待发货: {error_text}'
+                            )
 
                         # 标记锁为持有状态，并启动延迟释放任务
                         self._lock_hold_info[lock_key] = {
@@ -3199,14 +3531,26 @@ class XianyuLive:
     def extract_item_id_from_message(self, message):
         """从消息中提取商品ID的辅助方法"""
         try:
+            # 方法0: 从订单消息主体字段提取，优先级最高
+            item_id = self._extract_item_id_from_message_field(message)
+            if item_id:
+                return item_id
+
             # 方法1: 从message["1"]中提取（如果是字符串格式）
             message_1 = message.get('1')
             if isinstance(message_1, str):
-                # 尝试从字符串中提取数字ID
-                id_match = re.search(r'(\d{10,})', message_1)
-                if id_match:
-                    logger.info(f"从message[1]字符串中提取商品ID: {id_match.group(1)}")
-                    return id_match.group(1)
+                patterns = [
+                    r'(\d{8,})\.PNM',
+                    r'itemId=(\d{8,})',
+                    r'itemId[=:]"?(\d{8,})',
+                    r'"itemId"\s*:\s*"(\d{8,})"',
+                    r'item[_-]?id[=:]"?(\d{8,})',
+                ]
+                for pattern in patterns:
+                    id_match = re.search(pattern, message_1)
+                    if id_match:
+                        logger.info(f"从message[1]字符串中提取商品ID: {id_match.group(1)}")
+                        return id_match.group(1)
 
             # 方法2: 从message["3"]中提取
             message_3 = message.get('3', {})
@@ -3241,20 +3585,38 @@ class XianyuLive:
                 # 从消息内容中提取数字ID
                 content = message_3.get('content', '')
                 if isinstance(content, str) and content:
-                    id_match = re.search(r'(\d{10,})', content)
-                    if id_match:
-                        logger.info(f"【{self.cookie_id}】从消息内容中提取商品ID: {id_match.group(1)}")
-                        return id_match.group(1)
+                    content_patterns = [
+                        r'(\d{8,})\.PNM',
+                        r'itemId=(\d{8,})',
+                        r'itemId[=:]"?(\d{8,})',
+                        r'"itemId"\s*:\s*"(\d{8,})"',
+                        r'item[_-]?id[=:]"?(\d{8,})',
+                    ]
+                    for pattern in content_patterns:
+                        id_match = re.search(pattern, content)
+                        if id_match:
+                            logger.info(f"【{self.cookie_id}】从消息内容中提取商品ID: {id_match.group(1)}")
+                            return id_match.group(1)
 
             # 方法3: 遍历整个消息结构查找可能的商品ID
             def find_item_id_recursive(obj, path=""):
                 if isinstance(obj, dict):
                     # 直接查找itemId字段
-                    for key in ['itemId', 'item_id', 'id']:
+                    for key in ['itemId', 'item_id', 'itemID', 'itemid']:
                         if key in obj and isinstance(obj[key], (str, int)):
                             value = str(obj[key])
-                            if len(value) >= 10 and value.isdigit():
+                            if len(value) >= 8 and value.isdigit():
                                 logger.info(f"从{path}.{key}中提取商品ID: {value}")
+                                return value
+
+                    # URL类字段仅解析 itemId 参数，避免误提取 userId/orderId
+                    for url_key in ['reminderUrl', 'targetUrl', 'url']:
+                        if url_key in obj and isinstance(obj[url_key], str):
+                            url_text = obj[url_key]
+                            url_match = re.search(r'itemId=(\d{8,})', url_text)
+                            if url_match:
+                                value = url_match.group(1)
+                                logger.info(f"从{path}.{url_key}中提取商品ID: {value}")
                                 return value
 
                     # 递归查找
@@ -3264,11 +3626,19 @@ class XianyuLive:
                             return result
 
                 elif isinstance(obj, str):
-                    # 从字符串中提取可能的商品ID
-                    id_match = re.search(r'(\d{10,})', obj)
-                    if id_match:
-                        logger.info(f"从{path}字符串中提取商品ID: {id_match.group(1)}")
-                        return id_match.group(1)
+                    # 字符串兜底仅接受包含 itemId 标记或 PNM 后缀的内容
+                    text_patterns = [
+                        r'(\d{8,})\.PNM',
+                        r'itemId=(\d{8,})',
+                        r'itemId[=:]"?(\d{8,})',
+                        r'"itemId"\s*:\s*"(\d{8,})"',
+                        r'item[_-]?id[=:]"?(\d{8,})',
+                    ]
+                    for pattern in text_patterns:
+                        id_match = re.search(pattern, obj)
+                        if id_match:
+                            logger.info(f"从{path}字符串中提取商品ID: {id_match.group(1)}")
+                            return id_match.group(1)
 
                 return None
 
@@ -3707,7 +4077,7 @@ class XianyuLive:
             ]
 
             if send_message in system_messages:
-                logger.warning(f"📱 系统消息不发送通知: {send_message}")
+                logger.info(f"📱 系统消息不发送通知: {send_message}")
                 return
 
             # 生成通知的唯一标识（基于消息内容、chat_id、send_user_id）
@@ -3737,15 +4107,14 @@ class XianyuLive:
                 for key in expired_keys:
                     del self.last_notification_time[key]
 
-            logger.info(f"📱 开始发送消息通知 - 账号: {self.cookie_id}, 买家: {send_user_name}")
-
             # 获取当前账号的通知配置
             notifications = db_manager.get_account_notifications(self.cookie_id)
 
             if not notifications:
-                logger.warning(f"📱 账号 {self.cookie_id} 未配置消息通知，跳过通知发送")
+                logger.info(f"📱 账号 {self.cookie_id} 未配置消息通知，跳过通知发送")
                 return
 
+            logger.info(f"📱 开始发送消息通知 - 账号: {self.cookie_id}, 买家: {send_user_name}")
             logger.info(f"📱 找到 {len(notifications)} 个通知渠道配置")
 
             # 构建通知消息
@@ -4653,7 +5022,7 @@ class XianyuLive:
                             success = db_manager.insert_or_update_order(
                                 order_id=order_id,
                                 item_id=item_id,
-                                buyer_id=buyer_id,
+                                buyer_id=self._normalize_buyer_id(buyer_id),
                                 spec_name=spec_name,
                                 spec_value=spec_value,
                                 quantity=quantity,
@@ -4703,15 +5072,18 @@ class XianyuLive:
                 return None
 
     async def _auto_delivery(self, item_id: str, item_title: str = None, order_id: str = None, send_user_id: str = None):
-        """自动发货功能 - 获取卡券规则，执行延时，确认发货，发送内容"""
+        """自动发货功能 - 获取卡券规则，执行延时，确认发货，生成发送内容"""
         try:
             from db_manager import db_manager
 
             logger.info(f"开始自动发货检查: 商品ID={item_id}")
+            platform_confirmed = False
+            confirm_error = None
 
             # 获取商品详细信息
             item_info = None
-            search_text = item_title  # 默认使用传入的标题
+            # 占位标题不参与匹配，优先回退到item_id
+            search_text = None if self._is_placeholder_item_title(item_title) else item_title
 
             if item_id and item_id != "未知商品":
                 # 直接从数据库获取商品信息（发货时不再调用API）
@@ -4757,14 +5129,14 @@ class XianyuLive:
                             logger.warning(f"完整搜索文本: {search_text[:200]}...")
                         else:
                             logger.warning(f"数据库中商品标题和详情都为空: {item_id}")
-                            search_text = item_title or item_id
+                            search_text = item_id
                     else:
                         logger.warning(f"数据库中未找到商品信息: {item_id}")
-                        search_text = item_title or item_id
+                        search_text = item_id
 
                 except Exception as db_e:
                     logger.warning(f"从数据库获取商品信息失败: {self._safe_str(db_e)}")
-                    search_text = item_title or item_id
+                    search_text = item_id
 
             if not search_text:
                 search_text = item_id or "未知商品"
@@ -4826,8 +5198,34 @@ class XianyuLive:
                 if delivery_rules:
                     logger.info(f"✅ 找到匹配的普通发货规则: {len(delivery_rules)}个")
                 else:
-                    logger.warning(f"❌ 非多规格商品未找到匹配的普通发货规则，跳过自动发货")
-                    return None
+                    logger.warning(f"❌ 非多规格商品首次匹配未命中，尝试实时拉取商品详情后重试: {item_id}")
+
+                    # 兜底：数据库没有商品信息时，实时拉取详情再匹配一次
+                    fallback_search_text = ""
+                    try:
+                        fetched_detail = await self.fetch_item_detail_from_api(item_id) if item_id else ""
+                        if fetched_detail:
+                            # 尝试保存详情，后续同商品发货可复用
+                            try:
+                                await self.save_item_detail_only(item_id, fetched_detail)
+                            except Exception:
+                                pass
+                            fallback_search_text = fetched_detail.strip()
+                    except Exception as fetch_e:
+                        logger.warning(f"实时获取商品详情失败: {self._safe_str(fetch_e)}")
+
+                    if fallback_search_text:
+                        logger.info(f"使用实时商品详情重试匹配发货规则，文本长度: {len(fallback_search_text)}")
+                        delivery_rules = db_manager.get_delivery_rules_by_keyword(fallback_search_text)
+                        delivery_rules = [r for r in delivery_rules if not r.get('is_multi_spec')]
+                        if delivery_rules:
+                            logger.info(f"✅ 实时详情重试匹配成功: {len(delivery_rules)}个")
+                        else:
+                            logger.warning(f"❌ 实时详情重试仍未命中发货规则，跳过自动发货")
+                            return None
+                    else:
+                        logger.warning(f"❌ 无法获取可用商品详情用于重试匹配，跳过自动发货")
+                        return None
 
             # 检查匹配到的卡券数量，只有唯一匹配时才自动发货
             if len(delivery_rules) > 1:
@@ -4888,6 +5286,7 @@ class XianyuLive:
                 # 检查是否启用自动确认发货
                 if not self.is_auto_confirm_enabled():
                     logger.info(f"自动确认发货已关闭，跳过订单 {order_id}")
+                    confirm_error = "自动确认发货已关闭"
                 else:
                     # 检查确认发货冷却时间
                     current_time = time.time()
@@ -4898,15 +5297,18 @@ class XianyuLive:
                         if current_time - last_confirm_time < self.order_confirm_cooldown:
                             logger.info(f"订单 {order_id} 已在 {self.order_confirm_cooldown} 秒内确认过，跳过重复确认")
                             should_confirm = False
+                            platform_confirmed = True
 
                     if should_confirm:
                         logger.info(f"开始自动确认发货: 订单ID={order_id}, 商品ID={item_id}")
                         confirm_result = await self.auto_confirm(order_id, item_id)
                         if confirm_result.get('success'):
                             self.confirmed_orders[order_id] = current_time
+                            platform_confirmed = True
                             logger.info(f"🎉 自动确认发货成功！订单ID: {order_id}")
                         else:
-                            logger.warning(f"⚠️ 自动确认发货失败: {confirm_result.get('error', '未知错误')}")
+                            confirm_error = confirm_result.get('error', '未知错误')
+                            logger.warning(f"⚠️ 自动确认发货失败: {confirm_error}")
                             # 即使确认发货失败，也继续发送发货内容
 
             # 检查是否存在订单ID，只有存在订单ID才处理发货内容
@@ -4921,12 +5323,13 @@ class XianyuLive:
                         logger.warning(f"Cookie ID {self.cookie_id} 不存在于cookies表中，丢弃订单 {order_id}")
                     else:
                         existing_order = db_manager.get_order_by_id(order_id)
+                        normalized_send_user_id = self._normalize_buyer_id(send_user_id)
                         if not existing_order:
                             # 插入基本订单信息
                             success = db_manager.insert_or_update_order(
                                 order_id=order_id,
                                 item_id=item_id,
-                                buyer_id=send_user_id,
+                                buyer_id=normalized_send_user_id,
                                 cookie_id=self.cookie_id
                             )
                             
@@ -4943,6 +5346,14 @@ class XianyuLive:
                             
                             if success:
                                 logger.info(f"保存基本订单信息到数据库: {order_id}")
+                        elif normalized_send_user_id and self._order_needs_buyer_id_backfill(existing_order):
+                            backfill_success = db_manager.insert_or_update_order(
+                                order_id=order_id,
+                                buyer_id=normalized_send_user_id,
+                                cookie_id=self.cookie_id
+                            )
+                            if backfill_success:
+                                logger.info(f"回填订单买家ID成功: {order_id} -> {normalized_send_user_id}")
                 except Exception as db_e:
                     logger.error(f"保存基本订单信息失败: {self._safe_str(db_e)}")
 
@@ -4981,7 +5392,11 @@ class XianyuLive:
                     # 增加发货次数统计
                     db_manager.increment_delivery_times(rule['id'])
                     logger.info(f"自动发货成功: 规则ID={rule['id']}, 内容长度={len(final_content)}")
-                    return final_content
+                    return {
+                        'content': final_content,
+                        'platform_confirmed': platform_confirmed,
+                        'confirm_error': confirm_error,
+                    }
                 else:
                     logger.warning(f"获取发货内容失败: 规则ID={rule['id']}")
                     return None
@@ -7824,14 +8239,14 @@ class XianyuLive:
             # 安全地提取商品ID
             item_id = None
             try:
-                if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
+                # 优先使用消息主体中的商品ID，避免 reminderUrl 里的会话商品ID串单
+                item_id = self.extract_item_id_from_message(message)
+
+                # 如果主体消息里没有，再退回到 reminderUrl
+                if not item_id and "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
                     url_info = message["1"]["10"].get("reminderUrl", "")
                     if isinstance(url_info, str) and "itemId=" in url_info:
                         item_id = url_info.split("itemId=")[1].split("&")[0]
-
-                # 如果没有提取到，使用辅助方法
-                if not item_id:
-                    item_id = self.extract_item_id_from_message(message)
 
                 if not item_id:
                     item_id = f"auto_{user_id}_{int(time.time())}"
@@ -7842,7 +8257,7 @@ class XianyuLive:
                 item_id = f"auto_{user_id}_{int(time.time())}"
             # 处理订单状态消息
             try:
-                logger.info(message)
+                logger.debug(f"【{self.cookie_id}】消息摘要: {self._summarize_message_for_log(message)}")
                 msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
                 # 安全地检查订单状态
@@ -7867,6 +8282,49 @@ class XianyuLive:
 
             # 判断是否为聊天消息
             if not self.is_chat_message(message):
+                non_chat_trigger = self._extract_non_chat_trigger_message(message)
+                if non_chat_trigger:
+                    logger.info(f"[{msg_time}] 【{self.cookie_id}】非聊天消息命中自动发货触发词: {non_chat_trigger}")
+                    await self._handle_auto_delivery(
+                        websocket=websocket,
+                        message=message,
+                        send_user_name="系统消息",
+                        send_user_id=self._normalize_buyer_id(user_id) or "unknown",
+                        item_id=item_id,
+                        chat_id="",
+                        msg_time=msg_time
+                    )
+                    return
+
+                # 非聊天消息兜底：如果能唯一匹配到当前账号的待发货订单，也尝试自动发货
+                try:
+                    pending_order_id = self._find_pending_delivery_order_candidate(
+                        item_id=item_id,
+                        buyer_id=user_id,
+                        msg_time=msg_time
+                    )
+                    if pending_order_id:
+                        try:
+                            from db_manager import db_manager
+                            order_info = db_manager.get_order_by_id(pending_order_id)
+                            if order_info and order_info.get('item_id'):
+                                item_id = str(order_info.get('item_id'))
+                        except Exception as e:
+                            logger.error(f"[{msg_time}] 【{self.cookie_id}】读取候选订单商品ID失败: {self._safe_str(e)}")
+
+                        logger.info(f"[{msg_time}] 【{self.cookie_id}】非聊天消息匹配到待发货订单，触发自动发货: {pending_order_id}")
+                        await self._handle_auto_delivery(
+                            websocket=websocket,
+                            message=message,
+                            send_user_name="系统消息",
+                            send_user_id=self._normalize_buyer_id(user_id) or "unknown",
+                            item_id=item_id,
+                            chat_id="",
+                            msg_time=msg_time
+                        )
+                        return
+                except Exception as e:
+                    logger.error(f"[{msg_time}] 【{self.cookie_id}】非聊天消息待发货兜底检查失败: {self._safe_str(e)}")
                 logger.warning("非聊天消息")
                 return
 
@@ -7897,6 +8355,7 @@ class XianyuLive:
 
             # 格式化消息时间
             msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(create_time/1000))
+            ignored_system_reason = self._get_ignored_system_message_reason(send_message)
 
 
 
@@ -7909,19 +8368,22 @@ class XianyuLive:
 
                 return
             else:
-                logger.info(f"[{msg_time}] 【收到】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
+                if ignored_system_reason:
+                    logger.info(f"[{msg_time}] 【系统消息】用户(ID: {send_user_id}), 商品({item_id}): {send_message}")
+                else:
+                    logger.info(f"[{msg_time}] 【收到】用户: {send_user_name} (ID: {send_user_id}), 商品({item_id}): {send_message}")
 
-                # 🔔 立即发送消息通知（独立于自动回复功能）
-                # 检查是否为群组消息，如果是群组消息则跳过通知
-                try:
-                    session_type = message_10.get("sessionType", "1")  # 默认为个人消息类型
-                    if session_type == "30":
-                        logger.info(f"📱 检测到群组消息（sessionType=30），跳过消息通知")
-                    else:
-                        # 只对个人消息发送通知
-                        await self.send_notification(send_user_name, send_user_id, send_message, item_id, chat_id)
-                except Exception as notify_error:
-                    logger.error(f"📱 发送消息通知失败: {self._safe_str(notify_error)}")
+                    # 🔔 立即发送消息通知（独立于自动回复功能）
+                    # 检查是否为群组消息，如果是群组消息则跳过通知
+                    try:
+                        session_type = message_10.get("sessionType", "1")  # 默认为个人消息类型
+                        if session_type == "30":
+                            logger.info(f"📱 检测到群组消息（sessionType=30），跳过消息通知")
+                        else:
+                            # 只对个人消息发送通知
+                            await self.send_notification(send_user_name, send_user_id, send_message, item_id, chat_id)
+                    except Exception as notify_error:
+                        logger.error(f"📱 发送消息通知失败: {self._safe_str(notify_error)}")
 
 
 
@@ -7966,41 +8428,8 @@ class XianyuLive:
                     logger.error(f"订单状态处理失败: {self._safe_str(e)}")
 
             # 【优先处理】检查系统消息和自动发货触发消息（不受人工接入暂停影响）
-            if send_message == '[我已拍下，待付款]':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】系统消息不处理')
-                return
-            elif send_message == '[你关闭了订单，钱款已原路退返]':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】系统消息不处理')
-                return
-            elif send_message == '[不想宝贝被砍价?设置不砍价回复  ]':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】系统提示信息不处理')
-                return 
-            elif send_message == 'AI正在帮你回复消息，不错过每笔订单':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】系统提示信息不处理')
-                return 
-            elif send_message == '发来一条消息':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】系统通知消息不处理')
-                return
-            elif send_message == '发来一条新消息':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】系统通知消息不处理')
-                return
-            elif send_message == '[买家确认收货，交易成功]':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】交易完成消息不处理')
-                return
-            elif send_message == '快给ta一个评价吧~' or send_message == '快给ta一个评价吧～':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】评价提醒消息不处理')
-                return
-            elif send_message == '卖家人不错？送Ta闲鱼小红花':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】小红花提醒消息不处理')
-                return
-            elif send_message == '[你已确认收货，交易成功]':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】买家确认收货消息不处理')
-                return
-            elif send_message == '[你已发货]':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】发货确认消息不处理')
-                return
-            elif send_message == '已发货':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】发货确认消息不处理')
+            if ignored_system_reason:
+                logger.info(f'[{msg_time}] 【{self.cookie_id}】{ignored_system_reason}')
                 return
             # 【重要】检查是否为自动发货触发消息 - 即使在人工接入暂停期间也要处理
             elif self._is_auto_delivery_trigger(send_message):
@@ -8013,48 +8442,41 @@ class XianyuLive:
             elif send_message == '[卡片消息]':
                 # 检查是否为"我已小刀，待刀成"的卡片消息
                 try:
-                    # 从消息中提取卡片内容
-                    card_title = None
-                    if isinstance(message, dict) and "1" in message and isinstance(message["1"], dict):
-                        message_1 = message["1"]
-                        if "6" in message_1 and isinstance(message_1["6"], dict):
-                            message_6 = message_1["6"]
-                            if "3" in message_6 and isinstance(message_6["3"], dict):
-                                message_6_3 = message_6["3"]
-                                if "5" in message_6_3:
-                                    # 解析JSON内容
-                                    try:
-                                        card_content = json.loads(message_6_3["5"])
-                                        if "dxCard" in card_content and "item" in card_content["dxCard"]:
-                                            card_item = card_content["dxCard"]["item"]
-                                            if "main" in card_item and "exContent" in card_item["main"]:
-                                                ex_content = card_item["main"]["exContent"]
-                                                card_title = ex_content.get("title", "")
-                                    except (json.JSONDecodeError, KeyError) as e:
-                                        logger.warning(f"解析卡片消息失败: {e}")
+                    # 从消息中提取卡片标题
+                    card_title = self._extract_card_title_from_message(message)
 
                     # 检查是否为"我已小刀，待刀成"
                     if card_title == "我已小刀，待刀成":
                         logger.info(f'[{msg_time}] 【{self.cookie_id}】【系统】检测到"我已小刀，待刀成"，即使在暂停期间也继续处理')
 
-                        # 检查商品是否属于当前cookies
-                        if item_id and item_id != "未知商品":
-                            try:
-                                from db_manager import db_manager
-                                item_info = db_manager.get_item_info(self.cookie_id, item_id)
-                                if not item_info:
-                                    logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 商品 {item_id} 不属于当前账号，跳过免拼发货')
-                                    return
-                                logger.warning(f'[{msg_time}] 【{self.cookie_id}】✅ 商品 {item_id} 归属验证通过')
-                            except Exception as e:
-                                logger.error(f'[{msg_time}] 【{self.cookie_id}】检查商品归属失败: {self._safe_str(e)}，跳过免拼发货')
-                                return
-
                         # 提取订单ID
                         order_id = self._extract_order_id(message)
                         if not order_id:
-                            logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 未能提取到订单ID，无法执行免拼发货')
+                            order_id = self._find_pending_delivery_order_candidate(
+                                item_id=item_id,
+                                buyer_id=send_user_id,
+                                msg_time=msg_time
+                            )
+                            if not order_id:
+                                logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 未能提取到订单ID，无法执行免拼发货')
+                                return
+
+                        # 若订单中有商品ID，则纠正当前商品ID
+                        try:
+                            from db_manager import db_manager
+                            order_info = db_manager.get_order_by_id(order_id)
+                            db_item_id = str(order_info.get('item_id') or '').strip() if order_info else ''
+                            if db_item_id:
+                                item_id = db_item_id
+                        except Exception as e:
+                            logger.error(f'[{msg_time}] 【{self.cookie_id}】读取小刀订单商品ID失败: {self._safe_str(e)}')
+
+                        # 归属校验（弱校验策略，避免入库延迟导致误拦截）
+                        allowed, reason = self._check_delivery_ownership(item_id=item_id, order_id=order_id)
+                        if not allowed:
+                            logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 免拼发货归属校验失败，跳过: {reason}')
                             return
+                        logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 免拼发货归属校验通过: {reason}')
 
                         # 更新订单的is_bargain字段为True（标记为小刀订单）
                         try:
@@ -8062,7 +8484,7 @@ class XianyuLive:
                             db_manager.insert_or_update_order(
                                 order_id=order_id,
                                 item_id=item_id,
-                                buyer_id=send_user_id,
+                                buyer_id=self._normalize_buyer_id(send_user_id),
                                 cookie_id=self.cookie_id,
                                 is_bargain=True
                             )

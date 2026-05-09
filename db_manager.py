@@ -63,6 +63,24 @@ class DBManager:
         logger.info(f"SQL日志已启用，日志级别: {self.sql_log_level}")
 
         self.init_db()
+
+    @staticmethod
+    def _normalize_order_buyer_id(buyer_id: Optional[Any]) -> Optional[str]:
+        """标准化订单买家ID，过滤占位值，避免把 unknown_user 落库。"""
+        if buyer_id is None:
+            return None
+
+        normalized = str(buyer_id).strip()
+        if not normalized:
+            return None
+
+        if normalized.lower() in {"unknown", "unknown_user", "none", "null", "undefined"}:
+            return None
+
+        if normalized in {"未知", "未知用户"}:
+            return None
+
+        return normalized
     
     def init_db(self):
         """初始化数据库表结构"""
@@ -4480,6 +4498,7 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                buyer_id = self._normalize_order_buyer_id(buyer_id)
 
                 # 检查cookie_id是否在cookies表中存在（如果提供了cookie_id）
                 if cookie_id:
@@ -4636,6 +4655,48 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取Cookie订单列表失败: {cookie_id} - {e}")
                 return []
+
+    def find_delivery_order_candidate(self, cookie_id: str, item_id: str = None, buyer_id: str = None,
+                                      status_priority: list = None):
+        """按账号/商品/买家尝试定位可自动发货的候选订单（需唯一匹配）。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                normalized_buyer_id = self._normalize_order_buyer_id(buyer_id)
+
+                # 默认只匹配“待发货”，避免误发货到未付款订单
+                if status_priority is None:
+                    status_priority = ['pending_ship']
+
+                for status in status_priority:
+                    sql = '''
+                    SELECT order_id
+                    FROM orders
+                    WHERE cookie_id = ? AND order_status = ?
+                    '''
+                    params = [cookie_id, status]
+
+                    if item_id:
+                        sql += ' AND item_id = ?'
+                        params.append(item_id)
+                    if normalized_buyer_id:
+                        sql += ' AND buyer_id = ?'
+                        params.append(normalized_buyer_id)
+
+                    sql += ' ORDER BY updated_at DESC, created_at DESC LIMIT 2'
+                    cursor.execute(sql, tuple(params))
+                    rows = cursor.fetchall()
+
+                    if len(rows) == 1:
+                        return rows[0][0]
+                    if len(rows) > 1:
+                        # 非唯一匹配，不贸然选择，继续尝试下一个状态
+                        continue
+
+                return None
+            except Exception as e:
+                logger.error(f"查找自动发货候选订单失败: cookie_id={cookie_id}, item_id={item_id}, buyer_id={buyer_id} - {e}")
+                return None
 
     def get_all_orders(self, limit: int = 1000):
         """获取所有订单列表"""
